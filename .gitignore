@@ -1,0 +1,73 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+.venv-densify/
+venv/
+env/
+
+# Local agent memory
+.learnings/
+
+# xPano generated outputs
+work/
+frames/
+sparse/
+*_output/
+*_outputs/
+_acceptance*/
+_tracks*/
+_tmp*/
+xpano_alignment_summary.txt
+xpano_run_summary.json
+xpano_gui_error.log
+*.psx
+*.psx.files/
+*.psz
+
+# Local launch artifacts
+*.lnk
+xpano-ui/.vite-port
+
+# Frontend/package build dependencies
+xpano-ui/node_modules/
+xpano-ui/dist/
+xpano-ui/dist-ssr/
+xpano-ui/src-tauri/target/
+xpano-ui/src-tauri/gen/
+
+# Downloaded runtime dependencies used only for local packaging.
+# Keep xpano-ui/binaries/.gitignore and .gitkeep placeholders in git.
+xpano-ui/binaries/ffmpeg/*
+!xpano-ui/binaries/ffmpeg/.gitkeep
+xpano-ui/binaries/python/*
+!xpano-ui/binaries/python/.gitkeep
+
+# Optional bundled tools / model caches installed locally
+tools/
+densify/
+
+# Historical local copy, not part of the release root
+download/
+
+# Large raw media and reconstruction artifacts
+*.osv
+*.insv
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.ply
+*.las
+*.laz
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
