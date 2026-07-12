@@ -1,0 +1,10 @@
+# Runtime dependencies for scripts/xpano_masks.py.
+#
+# torch and torchvision are installed by scripts/install_masks.ps1 from the
+# selected PyTorch package index (CUDA or CPU). Keeping them here also makes
+# the complete runtime dependency set visible to packaging and audit tools.
+numpy>=1.26,<3
+Pillow>=10,<12
+opencv-python>=4.10,<5
+torch>=2.8,<3
+torchvision>=0.23,<1
