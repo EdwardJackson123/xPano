@@ -2,7 +2,7 @@
 
 ## Python Environments
 
-xPano uses two Python environments for different purposes. This separation is intentional: the main pipeline runs inside Metashape's embedded Python (which has no `pip`), while the densification and point-cloud cleaning features need PyTorch and Open3D which live in a dedicated virtual environment.
+xPano uses separate Python execution contexts for different purposes. This separation is intentional: the main pipeline runs inside Metashape's embedded Python, while ML features require a regular Python installation. Mask generation may use the configured system Python or an existing compatible virtual environment, but its dependencies must be installed into the exact interpreter selected in the UI.
 
 ### 1. Metashape Embedded Python (main pipeline)
 
@@ -44,7 +44,33 @@ xPano uses two Python environments for different purposes. This separation is in
 
 **Disk usage:** ~4-6 GB (mostly PyTorch + CUDA runtime)
 
-### 3. System/Minconda Python
+### 3. Mask generation environment
+
+**Used by:** `scripts/xpano_masks.py` (Mask R-CNN object segmentation).
+
+Install into the same Python executable configured in the xPano UI:
+
+```powershell
+# NVIDIA GPU / CUDA (recommended)
+.\INSTALL_MASKS_CUDA.bat
+
+# CPU-only fallback
+.\INSTALL_MASKS_CPU.bat
+
+# Explicit Python selected in xPano
+.\INSTALL_MASKS_CUDA.bat -Python "C:\path\to\python.exe"
+```
+
+The complete dependency declaration is in `mask_requirements.txt`. The installer
+selects the matching official PyTorch package index and downloads the torchvision
+Mask R-CNN ResNet-50 FPN COCO weights so that the first mask job does not need to
+download them. Use `-SkipModelDownload` only when preparing an offline package
+that supplies the PyTorch model cache separately.
+
+**Important:** installing into a different Python from the one selected in xPano
+will not make the dependencies available to mask generation.
+
+### 4. System/Minconda Python
 
 **Used by:** The Tauri GUI (`app.py`) for launching pipelines.
 
@@ -55,9 +81,11 @@ xPano uses two Python environments for different purposes. This separation is in
 - `piexif` — EXIF handling
 - `tqdm` — progress bars
 
-This Python only needs lightweight packages. It does **not** need open3d, torch, or pycolmap.
+This Python only needs lightweight packages for the main pipeline. If it is also
+selected for mask generation, install `mask_requirements.txt` through one of the
+mask installers above. It does **not** need open3d or pycolmap.
 
-### Why Two Pythons?
+### Why Separate Python Environments?
 
 | | Metashape Python | `.venv-densify` Python |
 |---|---|---|

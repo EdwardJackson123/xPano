@@ -47,6 +47,35 @@ export interface PipelineProgress {
 export interface PipelineComplete { outputPath: string }
 export interface PipelineError { error: string }
 
+export type MaskExpandMode = 'pixels' | 'percent'
+export type MaskDevice = 'auto' | 'cuda' | 'cpu'
+export type MaskPhase = 'idle' | 'loading' | 'running' | 'complete' | 'error'
+
+export interface MaskConfig {
+  targets: string[]
+  includeShadow: boolean
+  expandMode: MaskExpandMode
+  expandPixels: number
+  expandPercent: number
+  edgeFusePixels: number
+  device: MaskDevice
+  workers: number
+}
+
+export interface MaskProgress {
+  status: MaskPhase | ''
+  percent: number
+  message: string
+  elapsed: number
+  current?: number
+  total?: number
+  device?: string
+  outputPath?: string
+}
+
+export interface MaskComplete { outputPath: string }
+export interface MaskError { error: string }
+
 export interface PointCloudData {
   points: Float32Array; colors: Float32Array; numPoints: number; cameras: CameraPose[]
 }

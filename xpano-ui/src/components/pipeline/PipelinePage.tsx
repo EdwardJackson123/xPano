@@ -17,6 +17,8 @@ import {
   Play,
   Plus,
   Scissors,
+  Search,
+  ShieldCheck,
   Square,
   Terminal,
   Trash2,
@@ -32,6 +34,7 @@ import { ConfirmDialog } from '../shared/ConfirmDialog'
 import { VideoTrimmer } from './VideoTrimmer'
 import { useToast } from '../../hooks/useToast'
 import { usePipeline } from '../../hooks/usePipeline'
+import { useMaskProcess } from '../../hooks/useMaskProcess'
 import { useMorphSwap } from '../../hooks/useGsap'
 import type {
   AlignmentEngine,
@@ -40,6 +43,9 @@ import type {
   MaterialTrack,
   PipelineConfig,
   PipelinePhase,
+  MaskConfig,
+  MaskDevice,
+  MaskExpandMode,
   ThemeMode,
   TrackType,
 } from '../../lib/types'
@@ -91,6 +97,43 @@ const defaultConfig: PipelineConfig = {
 
 const defaultExtractConfig = { secondsPerFrame: 1.0, frameLimit: 0 }
 
+const defaultMaskConfig: MaskConfig = {
+  targets: ['person'],
+  includeShadow: false,
+  expandMode: 'pixels',
+  expandPixels: 15,
+  expandPercent: 1.0,
+  edgeFusePixels: 25,
+  device: 'auto',
+  workers: Math.max(1, Math.min(8, navigator.hardwareConcurrency || 4)),
+}
+
+const maskTargetOptions = [
+  { value: 'person', label: '人物', group: '常用目标' },
+  { value: 'car', label: '汽车', group: '常用目标' },
+  { value: 'bicycle', label: '自行车', group: '常用目标' },
+  { value: 'motorcycle', label: '摩托车', group: '常用目标' },
+  { value: 'bus', label: '公交车', group: '常用目标' },
+  { value: 'truck', label: '卡车', group: '常用目标' },
+  { value: 'animal', label: '动物（鸟/猫/狗）', group: '常用目标' },
+  { value: 'airplane', label: '飞机', group: '更多 COCO 类别' },
+  { value: 'train', label: '火车', group: '更多 COCO 类别' },
+  { value: 'boat', label: '船', group: '更多 COCO 类别' },
+  { value: 'bird', label: '鸟', group: '更多 COCO 类别' },
+  { value: 'cat', label: '猫', group: '更多 COCO 类别' },
+  { value: 'dog', label: '狗', group: '更多 COCO 类别' },
+  { value: 'horse', label: '马', group: '更多 COCO 类别' },
+  { value: 'sheep', label: '羊', group: '更多 COCO 类别' },
+  { value: 'cow', label: '牛', group: '更多 COCO 类别' },
+  { value: 'backpack', label: '背包', group: '更多 COCO 类别' },
+  { value: 'umbrella', label: '雨伞', group: '更多 COCO 类别' },
+  { value: 'handbag', label: '手提包', group: '更多 COCO 类别' },
+  { value: 'suitcase', label: '行李箱', group: '更多 COCO 类别' },
+  { value: 'bench', label: '长椅', group: '更多 COCO 类别' },
+  { value: 'chair', label: '椅子', group: '更多 COCO 类别' },
+  { value: 'couch', label: '沙发', group: '更多 COCO 类别' },
+] as const
+
 export function PipelinePage({
   themeMode,
   onThemeModeChange,
@@ -99,10 +142,12 @@ export function PipelinePage({
   const navigate = useNavigate()
   const [tracks, setTracks] = useState<MaterialTrack[]>([])
   const [config, setConfig] = useState(defaultConfig)
+  const [maskConfig, setMaskConfig] = useState(defaultMaskConfig)
   const [showRightPanel, setShowRightPanel] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState<MaterialTrack | null>(null)
   const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null)
   const { progress, running, logs, start: startPipeline, cancel, reset } = usePipeline()
+  const maskTask = useMaskProcess()
   const { toasts, removeToast, toast } = useToast()
   const shellRef = useRef<HTMLDivElement>(null)
   const logRef = useRef<HTMLDivElement>(null)
@@ -110,8 +155,8 @@ export function PipelinePage({
 
   // Lift running state to the host so the particle field can tune its motion budget.
   useEffect(() => {
-    onPipelineStateChange?.({ running, phase: progress.phase })
-  }, [running, progress.phase, onPipelineStateChange])
+    onPipelineStateChange?.({ running: running || maskTask.running, phase: progress.phase })
+  }, [running, maskTask.running, progress.phase, onPipelineStateChange])
 
   useEffect(() => () => {
     onPipelineStateChange?.({ running: false, phase: 'idle' })
@@ -130,6 +175,20 @@ export function PipelinePage({
     else if (progress.message.includes('取消')) toast.warning('任务已取消，可重新开始')
     else toast.error(progress.message || '高斯对齐过程中出错')
   }, [progress.phase, progress.message, toast])
+
+  const lastMaskOutcomeToastRef = useRef<string | null>(null)
+  useEffect(() => {
+    const status = maskTask.progress.status
+    if (status !== 'complete' && status !== 'error') {
+      lastMaskOutcomeToastRef.current = null
+      return
+    }
+    if (lastMaskOutcomeToastRef.current === status) return
+    lastMaskOutcomeToastRef.current = status
+    if (status === 'complete') toast.success('遮罩处理完成，已生成与 images 对应的 masks')
+    else if (maskTask.progress.message.includes('取消')) toast.warning('遮罩任务已取消，原有输出未受影响')
+    else toast.error(maskTask.progress.message || '遮罩处理过程中出错')
+  }, [maskTask.progress.status, maskTask.progress.message, toast])
 
   // Keep the terminal pinned to the latest line while logs stream in,
   // but only when the user hasn't scrolled up to read past entries.
@@ -287,6 +346,19 @@ export function PipelinePage({
     toast.info(`启动高斯对齐（${tracks.length} 组素材），将自动检查可复用抽帧`)
   }
 
+  const handleMaskStart = async () => {
+    if (!config.outputDir) {
+      toast.warning('请先选择包含最终 images 目录的输出目录')
+      return
+    }
+    if (running) {
+      toast.warning('请等待高斯对齐任务结束后再处理遮罩')
+      return
+    }
+    maskTask.start(config.outputDir, maskConfig)
+    toast.info('启动独立遮罩处理，将读取最终 images 并输出同级 masks')
+  }
+
   const handleCancel = () => {
     cancel()
   }
@@ -326,8 +398,20 @@ export function PipelinePage({
   }
 
   const noEngine = config.alignmentEngine === 'metashape' ? !config.metashapePath : !config.colmapPath
-  const canStart = tracks.length > 0 && Boolean(config.outputDir) && !noEngine
-  const idle = !running && progress.phase !== 'complete' && progress.phase !== 'error'
+  const canStart = tracks.length > 0 && Boolean(config.outputDir) && !noEngine && !maskTask.running
+  const canStartMask = Boolean(config.outputDir) && !running && !maskTask.running
+  const maskVisible = maskTask.running || maskTask.progress.status === 'complete' || maskTask.progress.status === 'error'
+  const visibleProgress = maskVisible ? {
+    phase: maskTask.progress.status === 'complete' ? 'complete' as const : maskTask.progress.status === 'error' ? 'error' as const : 'export' as const,
+    stage: 'mask',
+    percent: maskTask.progress.percent,
+    message: maskTask.progress.message,
+    elapsed: maskTask.progress.elapsed,
+    phasePercents: { extract: 0, align: 0, export: maskTask.progress.percent },
+  } : progress
+  const visibleRunning = maskVisible ? maskTask.running : running
+  const visibleLogs = maskVisible ? maskTask.logs : logs
+  const idle = !visibleRunning && visibleProgress.phase !== 'complete' && visibleProgress.phase !== 'error'
   const blockReason = !config.outputDir
     ? '请选择输出目录'
     : !tracks.length
@@ -556,6 +640,40 @@ export function PipelinePage({
                   <div className="ml-auto self-end"><SwitchRow label="GPU 加速" checked={config.colmapUseGpu} onClick={() => setConfig({ ...config, colmapUseGpu: !config.colmapUseGpu })} /></div>
               </>)}
             </div>
+            <div className="mt-3 border-t border-[var(--xp-line)] pt-3">
+              <div className="mb-2.5 flex items-center justify-between gap-3">
+                <h4 className="ui-label flex items-center gap-1.5 text-[11px]"><ShieldCheck className="h-3.5 w-3.5 text-brand" /> 遮罩参数</h4>
+                <span className="text-[10px] text-muted">最终 images → masks · 白色参与训练</span>
+              </div>
+              <div className="flex flex-wrap items-end gap-3">
+                <Field label="遮罩目标">
+                  <ThemeMultiSelect
+                    className="w-52"
+                    value={maskConfig.targets}
+                    onChange={(targets) => setMaskConfig({ ...maskConfig, targets })}
+                    options={maskTargetOptions}
+                  />
+                </Field>
+                <Field label="扩张方式">
+                  <ThemeSelect className="w-24" value={maskConfig.expandMode} onChange={(value) => setMaskConfig({ ...maskConfig, expandMode: value as MaskExpandMode })} options={[
+                    { value: 'pixels', label: '像素' }, { value: 'percent', label: '百分比' },
+                  ]} />
+                </Field>
+                {maskConfig.expandMode === 'pixels' ? (
+                  <Field label="扩张像素"><NumberInput value={maskConfig.expandPixels} onChange={(value) => setMaskConfig({ ...maskConfig, expandPixels: value })} /></Field>
+                ) : (
+                  <Field label="扩张百分比"><NumberInput value={maskConfig.expandPercent} step={0.1} onChange={(value) => setMaskConfig({ ...maskConfig, expandPercent: value })} /></Field>
+                )}
+                <Field label="边缘融合"><NumberInput value={maskConfig.edgeFusePixels} onChange={(value) => setMaskConfig({ ...maskConfig, edgeFusePixels: value })} /></Field>
+                <Field label="计算设备">
+                  <ThemeSelect className="w-24" value={maskConfig.device} onChange={(value) => setMaskConfig({ ...maskConfig, device: value as MaskDevice })} options={[
+                    { value: 'auto', label: '自动' }, { value: 'cuda', label: 'CUDA' }, { value: 'cpu', label: 'CPU' },
+                  ]} />
+                </Field>
+                <Field label="预读取线程"><NumberInput value={maskConfig.workers} min={1} onChange={(value) => setMaskConfig({ ...maskConfig, workers: value })} /></Field>
+                <SwitchRow label="包含邻近阴影" checked={maskConfig.includeShadow} onClick={() => setMaskConfig({ ...maskConfig, includeShadow: !maskConfig.includeShadow })} />
+              </div>
+            </div>
           </section>
 
           {/* Video clip trimmer — shows when a panoramic video track is selected */}
@@ -631,17 +749,20 @@ export function PipelinePage({
             idle={idle}
             canStart={canStart}
             blockReason={blockReason}
-            progress={progress}
-            running={running}
+            progress={visibleProgress}
+            running={visibleRunning}
             outputReady={Boolean(config.outputDir)}
             materialCount={tracks.length}
             engineReady={engineReady}
-            logs={logs}
+            logs={visibleLogs}
             logRef={logRef}
             onStart={handleStart}
-            onCancel={handleCancel}
-            onReset={reset}
+            onCancel={maskTask.running ? maskTask.cancel : handleCancel}
+            onReset={maskVisible ? maskTask.reset : reset}
             onOpenOutput={openOutput}
+            canStartMask={canStartMask}
+            onStartMask={handleMaskStart}
+            maskMode={maskVisible}
           />
         </div>
         {/* Right panel overlay for non-xl screens */}
@@ -657,17 +778,20 @@ export function PipelinePage({
               idle={idle}
               canStart={canStart}
               blockReason={blockReason}
-              progress={progress}
-              running={running}
+              progress={visibleProgress}
+              running={visibleRunning}
               outputReady={Boolean(config.outputDir)}
               materialCount={tracks.length}
               engineReady={engineReady}
-              logs={logs}
+              logs={visibleLogs}
               logRef={logRef}
               onStart={handleStart}
-              onCancel={handleCancel}
-              onReset={reset}
+              onCancel={maskTask.running ? maskTask.cancel : handleCancel}
+              onReset={maskVisible ? maskTask.reset : reset}
               onOpenOutput={openOutput}
+              canStartMask={canStartMask}
+              onStartMask={handleMaskStart}
+              maskMode={maskVisible}
             />
           </div>
         )}
@@ -819,6 +943,169 @@ function ThemeSelect({ value, onChange, options, className }: { value: string; o
   )
 }
 
+function ThemeMultiSelect({
+  value,
+  onChange,
+  options,
+  className,
+}: {
+  value: string[]
+  onChange: (value: string[]) => void
+  options: ReadonlyArray<{ value: string; label: string; group: string }>
+  className?: string
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number; width: number; maxHeight: number } | null>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  useLayoutEffect(() => {
+    if (!open) return
+    const updatePosition = () => {
+      const rect = triggerRef.current?.getBoundingClientRect()
+      if (!rect) return
+      const padding = 8
+      const gap = 6
+      const desiredHeight = 430
+      const spaceBelow = window.innerHeight - rect.bottom - gap - padding
+      const spaceAbove = rect.top - gap - padding
+      const opensUp = spaceBelow < 300 && spaceAbove > spaceBelow
+      const maxHeight = Math.min(desiredHeight, Math.max(240, opensUp ? spaceAbove : spaceBelow))
+      const width = Math.min(360, Math.max(300, rect.width))
+      const left = Math.min(Math.max(padding, rect.left), window.innerWidth - width - padding)
+      const rawTop = opensUp ? rect.top - gap - maxHeight : rect.bottom + gap
+      const top = Math.min(Math.max(padding, rawTop), window.innerHeight - maxHeight - padding)
+      setMenuPosition({ left, top, width, maxHeight })
+    }
+    updatePosition()
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+    return () => {
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const closeOutside = (event: PointerEvent) => {
+      const target = event.target as Node
+      if (rootRef.current?.contains(target) || menuRef.current?.contains(target)) return
+      setOpen(false)
+    }
+    const closeEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOutside)
+    document.addEventListener('keydown', closeEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside)
+      document.removeEventListener('keydown', closeEscape)
+    }
+  }, [open])
+
+  const selectedLabels = value.map((selectedValue) => options.find((option) => option.value === selectedValue)?.label ?? selectedValue)
+  const summary = selectedLabels.length <= 2 ? selectedLabels.join(' · ') : `${selectedLabels.slice(0, 2).join(' · ')} +${selectedLabels.length - 2}`
+  const normalizedQuery = query.trim().toLowerCase()
+  const filtered = options.filter((option) => !normalizedQuery || option.label.includes(query.trim()) || option.value.includes(normalizedQuery))
+  const groups = [...new Set(filtered.map((option) => option.group))]
+  const toggle = (target: string) => {
+    if (value.includes(target)) {
+      if (value.length === 1) return
+      onChange(value.filter((item) => item !== target))
+    } else {
+      onChange([...value, target])
+    }
+  }
+  const presets = [
+    { label: '仅人物', values: ['person'] },
+    { label: '人物与车辆', values: ['person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck'] },
+    { label: '常见动态目标', values: ['person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck', 'animal'] },
+  ]
+
+  return (
+    <div ref={rootRef} className={className || ''}>
+      <button
+        ref={triggerRef}
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+        className={`theme-select-trigger motion-press flex w-full items-center gap-1.5 rounded-comfortable px-2.5 py-2 text-[13px] ${open ? 'is-open' : ''}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className="min-w-0 flex-1 truncate text-left">{summary}</span>
+        <span className="rounded-full bg-brand/12 px-1.5 py-0.5 font-mono text-[10px] text-brand">{value.length}</span>
+        <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-muted transition-transform duration-200 ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && menuPosition && createPortal(
+        <div
+          ref={menuRef}
+          className="theme-select-menu fixed flex animate-in flex-col overflow-hidden fade-in zoom-in-95 slide-in-from-top-1 duration-150"
+          style={{ left: menuPosition.left, top: menuPosition.top, width: menuPosition.width, maxHeight: menuPosition.maxHeight }}
+          role="listbox"
+          aria-multiselectable="true"
+        >
+          <div className="border-b border-[var(--xp-line)] p-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted" />
+              <input
+                autoFocus
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="搜索中文或 COCO 类别…"
+                className="theme-input w-full rounded-comfortable border py-2 pl-8 pr-2 text-[12px] outline-none"
+              />
+            </div>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {presets.map((preset) => (
+                <button key={preset.label} type="button" onClick={() => onChange(preset.values)} className="rounded-full border border-[var(--xp-line)] bg-[var(--xp-control)] px-2 py-1 text-[10px] text-muted transition-colors hover:border-brand/35 hover:text-brand">
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="min-h-0 overflow-y-auto p-1.5">
+            {groups.map((group) => (
+              <div key={group} className="mb-1.5 last:mb-0">
+                <p className="px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-muted">{group}</p>
+                {filtered.filter((option) => option.group === group).map((option) => {
+                  const selected = value.includes(option.value)
+                  const locked = selected && value.length === 1
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      role="option"
+                      aria-selected={selected}
+                      title={locked ? '至少保留一个遮罩目标' : undefined}
+                      onClick={() => toggle(option.value)}
+                      className={`theme-select-option flex items-center gap-2 ${selected ? 'is-selected' : ''}`}
+                    >
+                      <span className={`grid h-4 w-4 shrink-0 place-items-center rounded border ${selected ? 'border-brand bg-brand text-white' : 'border-[var(--xp-line-strong)]'}`}>
+                        {selected && <CheckCircle2 className="h-3 w-3" />}
+                      </span>
+                      <span className="flex-1 text-left">{option.label}</span>
+                      <span className="font-mono text-[10px] text-muted">{option.value}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            ))}
+            {!filtered.length && <p className="px-3 py-6 text-center text-[12px] text-muted">没有匹配的类别</p>}
+          </div>
+          <div className="flex items-center justify-between border-t border-[var(--xp-line)] px-3 py-2 text-[10px] text-muted">
+            <span>已选择 {value.length} 项</span>
+            <span>至少保留一项</span>
+          </div>
+        </div>,
+        document.body,
+      )}
+    </div>
+  )
+}
+
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="block">
@@ -899,12 +1186,19 @@ interface StatusCellProps {
   onCancel: () => void
   onReset: () => void
   onOpenOutput: () => void
+  canStartMask: boolean
+  onStartMask: () => void
+  maskMode: boolean
 }
 
 function logTone(line: string) {
   if (line.includes('错误') || line.includes('失败') || line.includes('中断')) return 'is-danger'
   if (line.includes('完成') || line.includes('已导出')) return 'is-success'
   return ''
+}
+
+function formatStatusPercent(value: number, maskMode: boolean) {
+  return maskMode && value > 0 && value < 10 ? value.toFixed(1) : String(Math.round(value))
 }
 
 function StatusCell(props: StatusCellProps) {
@@ -917,7 +1211,7 @@ function StatusCell(props: StatusCellProps) {
     const target = Math.min(100, Math.max(0, props.progress.percent))
     if (props.progress.phase === 'idle' && target < displayPct.current) {
       displayPct.current = target
-      if (percentRef.current) percentRef.current.textContent = String(Math.round(target))
+      if (percentRef.current) percentRef.current.textContent = formatStatusPercent(target, props.maskMode)
       return () => cancelAnimationFrame(raf)
     }
     const start = displayPct.current
@@ -927,12 +1221,12 @@ function StatusCell(props: StatusCellProps) {
       const t = Math.min((now - startedAt) / dur, 1)
       const eased = 1 - Math.pow(1 - t, 3)
       displayPct.current = start + (target - start) * eased
-      if (percentRef.current) percentRef.current.textContent = String(Math.round(displayPct.current))
+      if (percentRef.current) percentRef.current.textContent = formatStatusPercent(displayPct.current, props.maskMode)
       if (t < 1) raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [props.progress.percent, props.progress.phase])
+  }, [props.progress.percent, props.progress.phase, props.maskMode])
 
   // Morph between ready / progress content when the idle flag flips.
   const stageRef = useMorphSwap<HTMLDivElement>({ trigger: idle })
@@ -957,7 +1251,7 @@ function StatusCell(props: StatusCellProps) {
         <div>
           <h2 className="text-[12px] font-medium text-ink">状态仪表</h2>
         </div>
-        <span className="rounded-full border border-[var(--xp-line)] bg-[var(--xp-control)] px-2 py-1 font-mono text-[11px] text-muted">{idle ? '待命' : props.running ? '运行中' : isDone ? '完成' : isCanceled ? '已取消' : '错误'}</span>
+        <span className="rounded-full border border-[var(--xp-line)] bg-[var(--xp-control)] px-2 py-1 font-mono text-[11px] text-muted">{props.maskMode ? '遮罩' : idle ? '待命' : props.running ? '运行中' : isDone ? '完成' : isCanceled ? '已取消' : '错误'}</span>
       </div>
 
       {idle && (
@@ -990,6 +1284,7 @@ function StatusCell(props: StatusCellProps) {
             percentRef={percentRef}
             isError={isError}
             isCanceled={isCanceled}
+            maskMode={props.maskMode}
           />
         )}
       </div>
@@ -1024,6 +1319,9 @@ function StatusCell(props: StatusCellProps) {
             <button onClick={props.onStart} disabled={!props.canStart} title={!props.canStart ? props.blockReason : undefined} className="theme-action-shadow motion-press inline-flex w-full items-center justify-center gap-2 rounded-card bg-brand px-4 py-3 text-[13px] font-semibold text-white transition-all hover:-translate-y-0.5 hover:bg-brand-hover disabled:cursor-not-allowed disabled:translate-y-0 disabled:bg-[var(--xp-line)] disabled:text-muted disabled:shadow-none">
               <Play className="h-4 w-4" fill="currentColor" /> 开始高斯对齐
             </button>
+            <button onClick={props.onStartMask} disabled={!props.canStartMask} title={!props.outputReady ? '请先选择包含最终 images 的输出目录' : undefined} className="glass-control motion-press inline-flex w-full items-center justify-center gap-2 rounded-card border border-brand/20 px-4 py-2.5 text-[13px] font-semibold text-ink/72 transition-all hover:border-brand/40 hover:text-brand disabled:cursor-not-allowed disabled:opacity-45">
+              <ShieldCheck className="h-4 w-4" /> 开始遮罩处理
+            </button>
             <button onClick={props.onOpenOutput} disabled={!props.outputReady} title={!props.outputReady ? '请先选择输出目录' : undefined} className="glass-control motion-press inline-flex w-full items-center justify-center gap-2 rounded-card px-4 py-2.5 text-[13px] font-semibold text-ink/72 transition-all hover:text-brand disabled:cursor-not-allowed disabled:opacity-45">
               <FolderOpen className="h-4 w-4" /> 打开输出目录
             </button>
@@ -1037,6 +1335,11 @@ function StatusCell(props: StatusCellProps) {
             <button onClick={props.onOpenOutput} className="theme-action-shadow motion-press inline-flex w-full items-center justify-center gap-2 rounded-card bg-brand px-4 py-2.5 text-[13px] font-semibold text-white transition-colors hover:bg-brand-hover">
               <FolderOpen className="h-4 w-4" /> 打开输出目录
             </button>
+            {!props.maskMode && (
+              <button onClick={props.onStartMask} disabled={!props.canStartMask} className="glass-control motion-press inline-flex w-full items-center justify-center gap-2 rounded-card border border-brand/20 px-4 py-2.5 text-[13px] font-semibold text-ink/72 transition-all hover:border-brand/40 hover:text-brand disabled:cursor-not-allowed disabled:opacity-45">
+                <ShieldCheck className="h-4 w-4" /> 开始遮罩处理
+              </button>
+            )}
             <button onClick={props.onReset} className="glass-control motion-press inline-flex w-full items-center justify-center gap-2 rounded-card px-4 py-2.5 text-[13px] font-semibold text-ink/72 transition-all hover:text-brand">返回界面</button>
           </>
         ) : isCanceled ? (
@@ -1109,12 +1412,14 @@ function ProgressContent({
   percentRef,
   isError,
   isCanceled,
+  maskMode,
 }: {
   progress: StatusCellProps['progress']
   running: boolean
   percentRef: React.RefObject<HTMLSpanElement | null>
   isError: boolean
   isCanceled: boolean
+  maskMode: boolean
 }) {
   const elapsed = progress.elapsed
   const time = `${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`
@@ -1125,7 +1430,7 @@ function ProgressContent({
   const orbitAngle = -Math.PI / 2 + (percent / 100) * 2 * Math.PI
   const orbitX = 60 + 44 * Math.cos(orbitAngle)
   const orbitY = 60 + 44 * Math.sin(orbitAngle)
-  const phaseText = progress.phase === 'idle' && running ? '启动中' : (phaseLabels[progress.phase] || progress.message)
+  const phaseText = maskMode ? progress.message : progress.phase === 'idle' && running ? '启动中' : (phaseLabels[progress.phase] || progress.message)
 
   return (
     <div className="flex flex-1 flex-col gap-3">
@@ -1180,7 +1485,7 @@ function ProgressContent({
 
           <div className="relative z-10 text-center">
             <p className="font-mono text-[32px] font-semibold leading-none text-ink">
-              <span ref={percentRef} className="digit-glow">{Math.round(percent)}</span>
+              <span ref={percentRef} className="digit-glow">{maskMode && percent > 0 && percent < 10 ? percent.toFixed(1) : Math.round(percent)}</span>
               <span className="ml-0.5 text-[16px] text-muted">%</span>
             </p>
             <p className="mt-1.5 font-mono text-[11px] text-muted">
@@ -1197,11 +1502,18 @@ function ProgressContent({
         </p>
       </div>
 
-      <div className="grid grid-cols-3 gap-2">
-        {(['extract', 'align', 'export'] as const).map((phase) => (
-          <PhasePill key={phase} phaseKey={phase} label={stageLabels[phase]} percent={progress.phasePercents[phase]} active={progress.phase === phase} />
-        ))}
-      </div>
+      {maskMode ? (
+        <div className="glass-inset flex items-center justify-between rounded-card px-3 py-2.5 text-[12px]">
+          <span className="inline-flex items-center gap-2 font-medium text-ink/75"><ShieldCheck className="h-4 w-4 text-brand" /> 独立训练遮罩</span>
+          <span className="font-mono text-[11px] text-muted">images → masks</span>
+        </div>
+      ) : (
+        <div className="grid grid-cols-3 gap-2">
+          {(['extract', 'align', 'export'] as const).map((phase) => (
+            <PhasePill key={phase} phaseKey={phase} label={stageLabels[phase]} percent={progress.phasePercents[phase]} active={progress.phase === phase} />
+          ))}
+        </div>
+      )}
     </div>
   )
 }

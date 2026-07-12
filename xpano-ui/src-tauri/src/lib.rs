@@ -1,9 +1,11 @@
 mod pipeline;
+mod mask_process;
 mod process_job;
 mod thumbgen;
 mod tool_resolver;
 
 use pipeline::PipelineState;
+use mask_process::{MaskProcessState, MaskProgressEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -1030,6 +1032,7 @@ fn run_streaming_densify_command(
 
 pub(crate) struct AppState {
     pipeline: Mutex<PipelineState>,
+    mask_process: Mutex<MaskProcessState>,
     densify_pid: Mutex<Option<u32>>,
 }
 
@@ -1051,6 +1054,31 @@ fn cancel_pipeline(state: State<'_, AppState>) -> Result<String, String> {
     let mut pipeline = state.pipeline.lock().map_err(|e| e.to_string())?;
     pipeline.cancel()?;
     Ok("Pipeline cancelled".into())
+}
+
+#[tauri::command]
+fn start_mask_process(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    python_exe: String,
+    args: Vec<String>,
+) -> Result<String, String> {
+    let mut process = state.mask_process.lock().map_err(|e| e.to_string())?;
+    process.start(app, &python_exe, "scripts/xpano_masks.py", &args)?;
+    Ok("Mask process started".into())
+}
+
+#[tauri::command]
+fn cancel_mask_process(state: State<'_, AppState>) -> Result<String, String> {
+    let mut process = state.mask_process.lock().map_err(|e| e.to_string())?;
+    process.cancel()?;
+    Ok("Mask process cancelled".into())
+}
+
+#[tauri::command]
+fn get_mask_process_progress(state: State<'_, AppState>) -> Result<Option<MaskProgressEvent>, String> {
+    let process = state.mask_process.lock().map_err(|e| e.to_string())?;
+    Ok(process.progress())
 }
 
 #[tauri::command]
@@ -1699,6 +1727,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             pipeline: Mutex::new(PipelineState::new()),
+            mask_process: Mutex::new(MaskProcessState::new()),
             densify_pid: Mutex::new(None),
         })
         .manage(Mutex::new(ThumbgenState::new()))
@@ -1712,6 +1741,7 @@ pub fn run() {
                     // Kill running pipeline and its entire process tree
                     if let Some(state) = window.app_handle().try_state::<AppState>() {
                         let _ = state.pipeline.lock().map(|mut p| p.cancel());
+                        let _ = state.mask_process.lock().map(|mut p| p.cancel());
                         if let Ok(mut pid) = state.densify_pid.lock() {
                             if let Some(pid) = pid.take() {
                                 kill_process_tree(pid);
@@ -1729,6 +1759,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_pipeline,
             cancel_pipeline,
+            start_mask_process,
+            cancel_mask_process,
+            get_mask_process_progress,
             open_output_folder,
             apply_colmap_axis_flip,
             apply_colmap_ground_alignment,
