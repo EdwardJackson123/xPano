@@ -17,7 +17,7 @@ BACKEND_STATUS = {
     METASHAPE_BACKEND: BackendStatus(
         name=METASHAPE_BACKEND,
         stable=True,
-        description="Verified Metashape Station-to-Folder workflow.",
+        description="Metashape native MultiplaneLayout with persistent shared-sensor master/slave rigs.",
     ),
     COLMAP_BACKEND: BackendStatus(
         name=COLMAP_BACKEND,

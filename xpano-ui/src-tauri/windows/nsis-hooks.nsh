@@ -9,6 +9,10 @@
   StrCpy $1 "$INSTDIR" "" $0
   StrCmp $1 "xPano" +2 0
     StrCpy $INSTDIR "$INSTDIR\xPano"
+  ; Tauri calls SetOutPath before this hook. If the hook changes $INSTDIR,
+  ; refresh the NSIS output directory or File /oname writes to the old path
+  ; while CreateDirectory uses the new one, leaving empty resource folders.
+  SetOutPath "$INSTDIR"
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL

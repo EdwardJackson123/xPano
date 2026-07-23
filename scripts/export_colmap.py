@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 import Metashape
 import os
-import cv2
 import numpy as np
 import struct
 import math
-import concurrent.futures
 import sys
 
 # ==========================================
@@ -182,96 +180,41 @@ def compute_undistorted_calib(sensor):
 # ==========================================
 # 2. 鱼眼/全景 Cubemap 系统
 # ==========================================
-def get_image_safe(camera):
-    try:
-        image = camera.photo.image()
-        if image is not None:
-            try: buf = image.tobytes()
-            except AttributeError: buf = image.tostring()
-            dt_str = str(image.data_type).upper()
-            if 'U16' in dt_str: np_type = np.uint16
-            elif 'F32' in dt_str: np_type = np.float32
-            else: np_type = np.uint8  
-            expected_len = image.width * image.height * image.cn * np.dtype(np_type).itemsize
-            if len(buf) == expected_len:
-                img_arr = np.frombuffer(buf, dtype=np_type).reshape(image.height, image.width, image.cn)
-                if np_type == np.uint16: img_arr = (img_arr / 256.0).astype(np.uint8)
-                elif np_type == np.float32: img_arr = np.clip(img_arr * 255.0, 0, 255).astype(np.uint8)
-                if image.cn == 3: return img_arr[:, :, ::-1].copy()
-                elif image.cn == 4: return cv2.cvtColor(img_arr, cv2.COLOR_RGBA2BGR)
-                elif image.cn == 1: return img_arr.copy()
-    except Exception as e:
-        pass
-    return None
-
 def get_face_configs(W):
     W_half = int(W / 2)
     return {
         'front':  (W,      W,      W_half, W_half),
-        'right':  (W_half, W,      W_half, W_half),
-        'left':   (W_half, W,      0,      W_half),
-        'top':    (W,      W_half, W_half, 0),
-        'bottom': (W,      W_half, W_half, W_half)
+        'right':  (W,      W,      W_half, W_half),
+        'left':   (W,      W,      W_half, W_half),
+        'top':    (W,      W,      W_half, W_half),
+        'bottom': (W,      W,      W_half, W_half)
     }
 
-def build_remap_grid(face, W, calib, R_face, sensor_info_str):
-    fw, fh, cx, cy = get_face_configs(W)[face]
-    u, v = np.meshgrid(np.arange(fw, dtype=np.float32), np.arange(fh, dtype=np.float32))
-    f_p = W / 2.0 
-    X, Y, Z = (u + 0.5 - cx) / f_p, (v + 0.5 - cy) / f_p, np.ones_like(u)
-    
-    Ri = R_face.T
-    Xb = Ri[0,0]*X + Ri[0,1]*Y + Ri[0,2]*Z
-    Yb = Ri[1,0]*X + Ri[1,1]*Y + Ri[1,2]*Z
-    Zb = Ri[2,0]*X + Ri[2,1]*Y + Ri[2,2]*Z
-    
-    r_xy = np.sqrt(Xb**2 + Yb**2)
-    theta = np.arctan2(r_xy, Zb)
-    
-    if 'Equisolid' in sensor_info_str: r_base = 2.0 * np.sin(theta / 2.0)
-    elif 'Stereographic' in sensor_info_str: r_base = 2.0 * np.tan(theta / 2.0)
-    elif 'Orthographic' in sensor_info_str: r_base = np.sin(theta)
-    else: r_base = theta
-    
-    k = [getattr(calib, kn, 0) or 0 for kn in ['k1','k2','k3','k4']]
-    p1, p2 = getattr(calib, 'p1', 0) or 0, getattr(calib, 'p2', 0) or 0
-    b1, b2 = getattr(calib, 'b1', 0) or 0, getattr(calib, 'b2', 0) or 0
-    
-    r2 = r_base**2
-    r_dist = r_base * (1 + k[0]*r2 + k[1]*r2**2 + k[2]*r2**3 + k[3]*r2**4)
-    mask = r_xy > 1e-10
-    xn, yn = np.zeros_like(theta), np.zeros_like(theta)
-    xn[mask], yn[mask] = Xb[mask] / r_xy[mask], Yb[mask] / r_xy[mask]
-    xd, yd = xn * r_dist, yn * r_dist
-    
-    if p1 != 0 or p2 != 0:
-        r_dist2 = r_dist**2
-        tang_x = p1 * (r_dist2 + 2 * xd**2) + 2 * p2 * xd * yd
-        tang_y = p2 * (r_dist2 + 2 * yd**2) + 2 * p1 * xd * yd
-        xd += tang_x; yd += tang_y
-    
-    mx = (calib.width/2.0 + calib.cx - 0.5) + xd * calib.f + xd * b1 + yd * b2
-    my = (calib.height/2.0 + calib.cy - 0.5) + yd * calib.f
-    return mx.astype(np.float32), my.astype(np.float32)
+def build_cubemap_calibration(face, W):
+    """Build the pinhole calibration that is also written to cameras.bin."""
+    fw, fh, principal_x, principal_y = get_face_configs(W)[face]
+    calib = Metashape.Calibration()
+    calib.type = Metashape.Sensor.Type.Frame
+    calib.width = int(fw)
+    calib.height = int(fh)
+    calib.f = float(W) / 2.0
+    # Metashape stores principal points relative to image center; COLMAP uses
+    # absolute pixel coordinates.
+    calib.cx = float(principal_x) - float(fw) / 2.0
+    calib.cy = float(principal_y) - float(fh) / 2.0
+    return calib
 
-def threaded_remap_and_save(img_src, mx, my, file_path):
-    try:
-        out_img = cv2.remap(img_src, mx, my, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT)
-        is_success, buffer = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-        if is_success:
-            with open(file_path, "wb") as f: f.write(buffer)
-    except: pass
 
-def project_track_to_pinhole(point_xyz, R, T, fx, fy, cx, cy, width, height):
-    X = np.array(point_xyz, dtype=np.float64)
-    pc = R @ X + T
-    if pc[2] <= 1e-8:
-        return None
-    u = fx * (pc[0] / pc[2]) + cx
-    v = fy * (pc[1] / pc[2]) + cy
-    if 0 <= u < width and 0 <= v < height:
-        return (float(u), float(v))
-    return None
+def rotation_transform(rotation):
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = rotation
+    return Metashape.Matrix(matrix.tolist())
+
+
+def save_jpeg(image, path):
+    compression = Metashape.ImageCompression()
+    compression.jpeg_quality = 100
+    image.save(path, compression)
 
 def camera_projections(chunk, camera):
     if not chunk.tie_points:
@@ -309,6 +252,10 @@ def run_mixed_export(out_dir=None):
     img_id_acc = 1
 
     valid_cameras = [c for c in chunk.cameras if c.transform and c.sensor and c.sensor.calibration and c.enabled]
+    if not valid_cameras:
+        raise RuntimeError(
+            "COLMAP export found zero aligned/enabled cameras; refusing to write an empty model"
+        )
     used_sensors = []
     used_sensor_keys = set()
     for camera in valid_cameras:
@@ -327,7 +274,7 @@ def run_mixed_export(out_dir=None):
             opt_W = int(round(calib.f * 2.0))
             if opt_W % 2 != 0: opt_W += 1
             sensor_map[sensor.key] = {
-                'type': 'Cubemap', 'opt_W': opt_W, 'faces': {}, 'info_str': sensor_info_str
+                'type': 'Cubemap', 'opt_W': opt_W, 'faces': {}
             }
             for face in ['front', 'left', 'right', 'top', 'bottom']:
                 f_cfg = get_face_configs(opt_W)[face]
@@ -361,15 +308,18 @@ def run_mixed_export(out_dir=None):
             }
 
     print(">>> [3/4] 开始处理照片 (严格防 OOM 控制并发)...", flush=True)
-    grid_cache = {}
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=5) # 严格限制并发仅供 5 个面使用
-    
+    # Each source fisheye contributes five conventional centered 90-degree
+    # pinhole views. The four surrounding views are aimed 45 degrees away
+    # from the optical axis, keeping the complete square inside the fisheye
+    # hemisphere. The previous 90-degree/half-frame views put the principal
+    # point on an image edge and caused severe off-axis stretching in 3DGS.
+    h = math.sqrt(0.5)
     R_faces = {
         'front': np.eye(3),
-        'left':  np.array([[0,0,1],[0,1,0],[-1,0,0]]),
-        'right': np.array([[0,0,-1],[0,1,0],[1,0,0]]),
-        'top':   np.array([[1,0,0],[0,0,1],[0,-1,0]]),
-        'bottom':np.array([[1,0,0],[0,0,-1],[0,1,0]])
+        'left':  np.array([[h,0,h],[0,1,0],[-h,0,h]]),
+        'right': np.array([[h,0,-h],[0,1,0],[h,0,h]]),
+        'top':   np.array([[1,0,0],[0,h,h],[0,-h,h]]),
+        'bottom':np.array([[1,0,0],[0,h,-h],[0,h,h]])
     }
 
     total_cams = len(valid_cameras)
@@ -427,10 +377,12 @@ def run_mixed_export(out_dir=None):
             R_w2c = R_c2w.T
             T_w2c = -R_w2c @ C_w
 
-            img_src = get_image_safe(camera)
+            source_image = camera.photo.image()
+            if source_image is None:
+                raise RuntimeError(f"Metashape could not load source image for {camera.label}")
+            source_calib = camera.sensor.calibration
+            identity = Metashape.Matrix.Diag([1, 1, 1, 1])
 
-            # 只为当前的这张图片创建临时并发池，处理完立刻清空内存
-            cam_tasks = []
             for face in ['front', 'left', 'right', 'top', 'bottom']:
                 cid = strategy['faces'][face]
                 img_name = f"cube_{face}_{img_name_base}"
@@ -438,20 +390,24 @@ def run_mixed_export(out_dir=None):
                 
                 rf, tf = R_faces[face] @ R_w2c, R_faces[face] @ T_w2c
                 qw, qx, qy, qz = matrix_to_quat(Metashape.Matrix(rf.tolist()))
-                fw, fh, vcx, vcy = get_face_configs(opt_W)[face]
+                fw, fh, _, _ = get_face_configs(opt_W)[face]
+                target_calib = build_cubemap_calibration(face, opt_W)
+                # R_faces maps a source-camera ray into the virtual face. The
+                # warp API takes camera-to-common transforms, hence transpose.
+                target_transform = rotation_transform(R_faces[face].T)
                 img_id = img_id_acc
                 pts2d = []
 
-                fx = fy = opt_W / 2.0
                 for proj in camera_projections(chunk, camera):
                     track_id = proj.track_id
                     point = points3d_list.get(track_id)
                     if point is None:
                         continue
-                    uv = project_track_to_pinhole(point['xyz'], rf, tf, fx, fy, vcx, vcy, fw, fh)
-                    if uv is None:
+                    target_ray = target_transform.inv().mulp(source_calib.unproject(proj.coord))
+                    uv = target_calib.project(target_ray)
+                    if uv is None or not (0 <= uv.x < fw and 0 <= uv.y < fh):
                         continue
-                    pts2d.append((uv[0], uv[1], track_id))
+                    pts2d.append((float(uv.x), float(uv.y), track_id))
                     point['refs'].append((img_id, len(pts2d) - 1))
                 
                 colmap_imgs.append({
@@ -460,18 +416,13 @@ def run_mixed_export(out_dir=None):
                 })
                 img_id_acc += 1
 
-                if img_src is not None:
-                    cache_key = (camera.sensor.key, opt_W, face)
-                    if cache_key not in grid_cache:
-                        grid_cache[cache_key] = build_remap_grid(face, opt_W, camera.sensor.calibration, R_faces[face], strategy['info_str'])
-                    mx, my = grid_cache[cache_key]
-                    # 提交这一个面的渲染任务
-                    cam_tasks.append(executor.submit(threaded_remap_and_save, img_src.copy(), mx, my, os.path.join(images_dir, img_name)))
-            
-            if cam_tasks:
-                concurrent.futures.wait(cam_tasks)
-
-    executor.shutdown()
+                warped = source_image.warp(
+                    source_calib,
+                    identity,
+                    target_calib,
+                    target_transform,
+                )
+                save_jpeg(warped, os.path.join(images_dir, img_name))
 
     points3d_list = {track_id: point for track_id, point in points3d_list.items() if point['refs']}
 

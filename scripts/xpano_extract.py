@@ -1,3 +1,5 @@
+import json
+import math
 import re
 import shutil
 import subprocess
@@ -12,6 +14,92 @@ from scripts.runtime_paths import locate_ffmpeg, locate_ffprobe
 
 
 SUPPORTED_EXTENSIONS = {".insv", ".osv", ".mp4"}
+
+
+def _probe_media(input_path: Path):
+    result = subprocess.run(
+        [
+            locate_ffprobe(), "-v", "error", "-show_streams", "-show_format",
+            "-of", "json", str(input_path),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return json.loads(result.stdout or "{}")
+
+
+def _video_streams(input_path: Path):
+    streams = []
+    for stream in _probe_media(input_path).get("streams", []):
+        if stream.get("codec_type") == "video" and not stream.get("disposition", {}).get("attached_pic"):
+            streams.append(stream)
+    return streams
+
+
+def _stream_time(stream, key, default=None):
+    try:
+        value = float(stream.get(key))
+        return value if math.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _validate_split_sync(left: Path, right: Path, fps, log_cb=None):
+    left_streams = _video_streams(left)
+    right_streams = _video_streams(right)
+    if len(left_streams) != 1 or len(right_streams) != 1:
+        raise RuntimeError(
+            "Paired INSV files must each contain exactly one video stream; "
+            f"got {len(left_streams)} and {len(right_streams)}"
+        )
+    ls, rs = left_streams[0], right_streams[0]
+    start_l = _stream_time(ls, "start_time", 0.0)
+    start_r = _stream_time(rs, "start_time", 0.0)
+    duration_l = _stream_time(ls, "duration")
+    duration_r = _stream_time(rs, "duration")
+    tolerance = max(0.05, 0.5 / max(float(fps), 1e-6))
+    if abs(start_l - start_r) > tolerance:
+        raise RuntimeError(
+            f"Dual-fisheye streams are not synchronized: start PTS differs by {abs(start_l - start_r):.3f}s"
+        )
+    if duration_l is not None and duration_r is not None and abs(duration_l - duration_r) > tolerance:
+        raise RuntimeError(
+            f"Dual-fisheye streams have different durations: {duration_l:.3f}s vs {duration_r:.3f}s"
+        )
+    if log_cb:
+        log_cb(
+            "dual-fisheye sync verified: "
+            f"start delta={abs(start_l - start_r):.4f}s, tolerance={tolerance:.4f}s"
+        )
+    return int(ls["index"]), int(rs["index"])
+
+
+def _dual_video_stream_indices(input_path: Path, fps=None):
+    streams = _video_streams(input_path)
+    if len(streams) != 2:
+        raise RuntimeError(
+            f"Panorama OSV/MP4 must contain exactly two video streams; found {len(streams)}. "
+            "A normal video plus audio is not a dual-fisheye source."
+        )
+    if fps:
+        start_a = _stream_time(streams[0], "start_time", 0.0)
+        start_b = _stream_time(streams[1], "start_time", 0.0)
+        duration_a = _stream_time(streams[0], "duration")
+        duration_b = _stream_time(streams[1], "duration")
+        tolerance = max(0.05, 0.5 / max(float(fps), 1e-6))
+        if abs(start_a - start_b) > tolerance:
+            raise RuntimeError(
+                f"Dual-fisheye streams are not synchronized: start PTS differs by {abs(start_a - start_b):.3f}s"
+            )
+        if duration_a is not None and duration_b is not None and abs(duration_a - duration_b) > tolerance:
+            raise RuntimeError(
+                f"Dual-fisheye streams have different durations: {duration_a:.3f}s vs {duration_b:.3f}s"
+            )
+    return int(streams[0]["index"]), int(streams[1]["index"])
 
 
 def _apply_exif(img_path: Path, model: str, make: str):
@@ -207,17 +295,18 @@ def _extract_one(args):
     seek_args = (["-ss", str(start_time)] if has_start else [])
     t_args = (["-t", str(duration)] if has_duration else [])
     if task["type"] == "insta_split":
+        left_stream, right_stream = _validate_split_sync(left, right, fps, log_cb=log_cb)
         cmd = [
             locate_ffmpeg(), "-hide_banner", "-y", "-nostdin", "-progress", "pipe:1", "-nostats",
             *seek_args, "-i", str(left),
             *seek_args, "-i", str(right),
-            "-map", "0:0", *t_args, "-vf", f"fps={fps}",
+            "-map", f"0:{left_stream}", *t_args, "-vf", f"fps={fps}",
         ]
         _append_frame_limit(cmd, max_frames)
         cmd.extend([
             "-q:v", "2",
             str(out_root / f"{base_name}_L_%05d.jpg"),
-            "-map", "1:0", *t_args, "-vf", f"fps={fps}",
+            "-map", f"1:{right_stream}", *t_args, "-vf", f"fps={fps}",
         ])
         _append_frame_limit(cmd, max_frames)
         cmd.extend([
@@ -225,16 +314,17 @@ def _extract_one(args):
             str(out_root / f"{base_name}_R_%05d.jpg"),
         ])
     else:
+        left_stream, right_stream = _dual_video_stream_indices(left, fps=fps)
         cmd = [
             locate_ffmpeg(), "-hide_banner", "-y", "-nostdin", "-progress", "pipe:1", "-nostats",
             *seek_args, "-i", str(left),
-            "-map", "0:0", *t_args, "-vf", f"fps={fps}",
+            "-map", f"0:{left_stream}", *t_args, "-vf", f"fps={fps}",
         ]
         _append_frame_limit(cmd, max_frames)
         cmd.extend([
             "-q:v", "2",
             str(out_root / f"{base_name}_L_%05d.jpg"),
-            "-map", "0:1", *t_args, "-vf", f"fps={fps}",
+            "-map", f"0:{right_stream}", *t_args, "-vf", f"fps={fps}",
         ])
         _append_frame_limit(cmd, max_frames)
         cmd.extend([
@@ -254,7 +344,14 @@ def _extract_one(args):
 
     left_files = sorted(out_root.glob(f"{base_name}_L_*.jpg"))
     right_files = sorted(out_root.glob(f"{base_name}_R_*.jpg"))
-    count = min(len(left_files), len(right_files))
+    if len(left_files) != len(right_files):
+        raise RuntimeError(
+            "Dual-fisheye extraction produced unequal frame counts; refusing to silently pair "
+            f"{len(left_files)} left frames with {len(right_files)} right frames"
+        )
+    count = len(left_files)
+    if count == 0:
+        raise RuntimeError("Dual-fisheye extraction produced no synchronized frame pairs")
     if max_frames and max_frames > 0:
         count = min(count, max_frames)
     extracted = []
@@ -290,8 +387,13 @@ def extract_frames(input_path, out_root, fps, max_frames=0, start_time=0.0, end_
             other = "10" if side == "00" else "00"
             partner = input_path.parent / f"{prefix}_{other}_{suffix}.insv"
             if partner.exists():
-                files = [input_path, partner]
-                pair_map[input_path] = partner
+                # Insta360 naming is canonical: _00 is lens/stream L and _10 is R.
+                # Never let the file the user happened to select flip the rig.
+                left_path = input_path.parent / f"{prefix}_00_{suffix}.insv"
+                right_path = input_path.parent / f"{prefix}_10_{suffix}.insv"
+                files = [left_path, right_path]
+                pair_map[left_path] = right_path
+                input_path = left_path
     task = {
         "clean_name": input_path.stem,
         "left_file": input_path,

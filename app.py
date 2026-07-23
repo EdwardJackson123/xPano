@@ -32,18 +32,20 @@ APP_TITLE = "xPano 多相机轨重建"
 tk = None
 filedialog = None
 messagebox = None
+simpledialog = None
 ttk = None
 Image = None
 ImageTk = None
 
 
 def load_gui_dependencies():
-    global tk, filedialog, messagebox, ttk, Image, ImageTk
+    global tk, filedialog, messagebox, simpledialog, ttk, Image, ImageTk
     if tk is not None:
         return
     import tkinter as _tk
     from tkinter import filedialog as _filedialog
     from tkinter import messagebox as _messagebox
+    from tkinter import simpledialog as _simpledialog
     from tkinter import ttk as _ttk
     from PIL import Image as _Image
     from PIL import ImageTk as _ImageTk
@@ -51,6 +53,7 @@ def load_gui_dependencies():
     tk = _tk
     filedialog = _filedialog
     messagebox = _messagebox
+    simpledialog = _simpledialog
     ttk = _ttk
     Image = _Image
     ImageTk = _ImageTk
@@ -75,6 +78,9 @@ class MaterialTrack:
     trim: tuple = None
     seconds_per_frame: float = None
     max_frames: int = None
+    # Stable identifier for one physical panorama camera. Tracks with the same
+    # value share left/right intrinsics and one rigid-rig calibration.
+    device_profile: str = None
 
 
 @dataclass
@@ -138,13 +144,16 @@ def material_tracks_to_job_config(
             if track_max_frames < 0:
                 raise ValueError(f"Panorama track {track.label or track.track_type} max_frames must be greater than or equal to 0")
             for path in paths:
-                panorama_videos.append({
+                video_spec = {
                     "path": path,
                     "start": float(start),
                     "end": float(end),
                     "seconds_per_frame": track_seconds_per_frame,
                     "max_frames": track_max_frames,
-                })
+                }
+                if track.device_profile:
+                    video_spec["device_profile"] = track.device_profile
+                panorama_videos.append(video_spec)
         elif track.track_type == "standard_photos":
             standard_photo_tracks.append((track.label, paths))
         elif track.track_type == "aerial_photos":
@@ -219,6 +228,11 @@ def _norm_path(path):
     return str(Path(path).resolve()).replace("\\", "/").rstrip("/").casefold()
 
 
+def _norm_device_profile(value):
+    value = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "").strip())
+    return re.sub(r"_+", "_", value).strip("_").casefold()
+
+
 def _job_video_specs(job):
     specs = []
     for item in getattr(job, "panorama_videos", []) or []:
@@ -229,6 +243,7 @@ def _job_video_specs(job):
                 round(float(item.get("end", 0.0) or 0.0), 3),
                 round(float(item.get("seconds_per_frame", getattr(job, "seconds_per_frame", 1.0)) or 1.0), 6),
                 int(item.get("max_frames", getattr(job, "max_frames", 0)) or 0),
+                _norm_device_profile(item.get("device_profile") or Path(item["path"]).stem),
             ))
         else:
             specs.append((
@@ -237,6 +252,7 @@ def _job_video_specs(job):
                 0.0,
                 round(float(getattr(job, "seconds_per_frame", 1.0) or 1.0), 6),
                 int(getattr(job, "max_frames", 0) or 0),
+                _norm_device_profile(Path(item).stem),
             ))
     return sorted(specs)
 
@@ -255,6 +271,7 @@ def _manifest_video_specs(manifest):
             round(float(track.get("end_time", 0.0) or 0.0), 3),
             round(float(track.get("seconds_per_frame", 1.0) or 1.0), 6),
             int(track.get("max_frames", 0) or 0),
+            _norm_device_profile(track.get("device_profile") or Path(paths[0]).stem),
         ))
     return sorted(specs)
 
@@ -533,6 +550,8 @@ def write_run_summary(job: MultiTrackJobConfig):
             for name in ["cameras.bin", "images.bin", "points3D.bin"]
         },
         "alignment_summary": str(job.output_dir / "workspace" / "alignment_summary.txt"),
+        "alignment_quality_report": str(job.output_dir / "workspace" / "alignment_quality_report.json"),
+        "project": str(job.output_dir / "workspace" / "xpano.psx"),
     }
     (job.output_dir / "workspace" / "run_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -971,7 +990,7 @@ class App:
         tracks_box.columnconfigure(0, weight=1)
         self.tracks_tree = ttk.Treeview(
             tracks_box,
-            columns=("type", "label", "paths"),
+            columns=("type", "label", "device", "paths"),
             show="headings",
             height=5,
             selectmode="extended",
@@ -981,6 +1000,8 @@ class App:
         self.tracks_tree.heading("paths", text="路径")
         self.tracks_tree.column("type", width=140, stretch=False)
         self.tracks_tree.column("label", width=160, stretch=False)
+        self.tracks_tree.heading("device", text="Device profile")
+        self.tracks_tree.column("device", width=140, stretch=False)
         self.tracks_tree.column("paths", width=640, stretch=True)
         self.tracks_tree.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
         track_buttons = ttk.Frame(tracks_box)
@@ -1053,11 +1074,16 @@ class App:
         self.log = tk.Text(log_box, height=12, wrap="word")
         self.log.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
 
-    def _add_material_track(self, track_type, label, paths):
+    def _add_material_track(self, track_type, label, paths, device_profile=None):
         paths = [Path(path) for path in paths]
         if not paths:
             return
-        self.material_tracks.append(MaterialTrack(track_type=track_type, label=label, paths=paths))
+        self.material_tracks.append(MaterialTrack(
+            track_type=track_type,
+            label=label,
+            paths=paths,
+            device_profile=device_profile,
+        ))
         self._refresh_tracks_tree()
 
     def _refresh_tracks_tree(self):
@@ -1065,7 +1091,10 @@ class App:
             self.tracks_tree.delete(item)
         for index, track in enumerate(self.material_tracks):
             display_paths = "; ".join(str(path) for path in track.paths)
-            self.tracks_tree.insert("", "end", iid=str(index), values=(track.track_type, track.label, display_paths))
+            self.tracks_tree.insert(
+                "", "end", iid=str(index),
+                values=(track.track_type, track.label, track.device_profile or "-", display_paths),
+            )
         self.track_count_var.set(f"{len(self.material_tracks)} tracks")
         self._sync_start_button_state()
 
@@ -1089,9 +1118,29 @@ class App:
 
     def add_panorama_track(self):
         paths = filedialog.askopenfilenames(filetypes=[("Panorama video", "*.osv *.insv *.mp4"), ("All", "*.*")])
+        if not paths:
+            return
+        existing = next(
+            (
+                track.device_profile
+                for track in self.material_tracks
+                if track.track_type == "panorama_video" and track.device_profile
+            ),
+            "camera_1",
+        )
+        device_profile = simpledialog.askstring(
+            "Panorama camera",
+            "Physical camera profile ID. Reuse the same ID for clips from the same camera.",
+            initialvalue=existing,
+            parent=self.root,
+        )
+        if not device_profile or not device_profile.strip():
+            return
         for path in paths:
             video = Path(path)
-            self._add_material_track("panorama_video", video.stem, [video])
+            self._add_material_track(
+                "panorama_video", video.stem, [video], device_profile=device_profile.strip()
+            )
 
     def add_standard_photo_track(self):
         path = filedialog.askdirectory(title="Select standard photo folder")

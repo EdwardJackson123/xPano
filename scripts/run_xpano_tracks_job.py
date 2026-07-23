@@ -39,12 +39,16 @@ def build_material_tracks(
     pano_max_frames=None,
     default_seconds_per_frame=1.0,
     default_max_frames=0,
+    pano_devices=None,
 ):
     tracks = []
     pano_starts = pano_starts or []
     pano_ends = pano_ends or []
     pano_seconds_per_frame = pano_seconds_per_frame or []
     pano_max_frames = pano_max_frames or []
+    pano_devices = pano_devices or []
+    if pano_devices and len(pano_devices) != len(panorama_videos):
+        raise ValueError("--pano-device must be provided once for each --pano")
     for idx, path in enumerate(panorama_videos):
         video = Path(path).resolve()
         # Pair trim windows with pano entries by position; missing entries default to no trim.
@@ -52,6 +56,7 @@ def build_material_tracks(
         end = pano_ends[idx] if idx < len(pano_ends) else 0.0
         seconds_per_frame = pano_seconds_per_frame[idx] if idx < len(pano_seconds_per_frame) else default_seconds_per_frame
         max_frames = pano_max_frames[idx] if idx < len(pano_max_frames) else default_max_frames
+        device_profile = pano_devices[idx] if pano_devices else None
         trim = (start, end) if (start or end) else None
         tracks.append(MaterialTrack(
             track_type="panorama_video",
@@ -60,6 +65,7 @@ def build_material_tracks(
             trim=trim,
             seconds_per_frame=seconds_per_frame,
             max_frames=max_frames,
+            device_profile=device_profile,
         ))
     for label, paths in standard_tracks:
         tracks.append(MaterialTrack(track_type="standard_photos", label=label, paths=[Path(path).resolve() for path in paths]))
@@ -127,6 +133,7 @@ def main():
     parser.add_argument("--pano-end", action="append", type=float, default=[], help="Panorama trim end (seconds), paired with --pano by position. 0 = full length.")
     parser.add_argument("--pano-seconds-per-frame", action="append", type=float, default=[], help="Per-panorama extraction interval in seconds, paired with --pano by position.")
     parser.add_argument("--pano-max-frames", action="append", type=int, default=[], help="Per-panorama frame limit, paired with --pano by position. 0 = no limit.")
+    parser.add_argument("--pano-device", action="append", default=[], help="Physical camera profile ID for each --pano. Reuse the same ID to share intrinsics and rigid-rig calibration across clips.")
     parser.add_argument("--standard-track", action="append", nargs="+", default=[], metavar=("LABEL", "PATH"))
     parser.add_argument("--aerial-track", action="append", nargs="+", default=[], metavar=("LABEL", "PATH"))
     parser.add_argument("--keep-generated", action="store_true")
@@ -220,6 +227,7 @@ def main():
             pano_max_frames=args.pano_max_frames,
             default_seconds_per_frame=args.seconds_per_frame,
             default_max_frames=args.max_frames,
+            pano_devices=args.pano_device,
         )
         job = material_tracks_to_job_config(
             tracks=tracks,

@@ -157,7 +157,7 @@ def build_photo_sensor_groups(base_label, photos):
     return list(groups.values())
 
 
-def build_panorama_track(index, video_path, work_dir, seconds_per_frame, max_frames, start_time=0.0, end_time=0.0, preview_cb=None, progress_cb=None, log_cb=None):
+def build_panorama_track(index, video_path, work_dir, seconds_per_frame, max_frames, start_time=0.0, end_time=0.0, preview_cb=None, progress_cb=None, log_cb=None, device_profile=None):
     video = Path(video_path).resolve()
     if video.suffix.lower() not in PANO_EXTENSIONS:
         raise ValueError(f"Unsupported panorama video: {video}")
@@ -194,6 +194,7 @@ def build_panorama_track(index, video_path, work_dir, seconds_per_frame, max_fra
         "track_id": track_id,
         "track_type": "panorama_video",
         "device_label": label,
+        "device_profile": safe_id(device_profile or label).lower(),
         "source_paths": [str(video)],
         "seconds_per_frame": seconds_per_frame,
         "max_frames": max_frames,
@@ -323,11 +324,13 @@ def build_manifest(output_dir, panorama_videos=None, standard_photo_tracks=None,
             end = float(video.get("end", 0.0) or 0.0)
             track_seconds_per_frame = float(video["seconds_per_frame"]) if "seconds_per_frame" in video else seconds_per_frame
             track_max_frames = int(video["max_frames"]) if "max_frames" in video else max_frames
+            device_profile = video.get("device_profile") or Path(video_path).stem
         else:
             video_path = video
             start, end = 0.0, 0.0
             track_seconds_per_frame = seconds_per_frame
             track_max_frames = max_frames
+            device_profile = Path(video_path).stem
         tracks.append(
             build_panorama_track(
                 index=index,
@@ -340,6 +343,7 @@ def build_manifest(output_dir, panorama_videos=None, standard_photo_tracks=None,
                 preview_cb=preview_cb,
                 progress_cb=progress_cb,
                 log_cb=log_cb,
+                device_profile=device_profile,
             )
         )
         index += 1
